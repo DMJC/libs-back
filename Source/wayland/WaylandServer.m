@@ -146,6 +146,12 @@ handle_global(void *data, struct wl_registry *registry, uint32_t name,
 	= wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
       NSDebugLog(@"wayland: found xdg-decoration-manager interface");
     }
+  else if (strcmp(interface, wl_data_device_manager_interface.name) == 0)
+    {
+      wlconfig->data_device_manager =
+        wl_registry_bind(registry, name, &wl_data_device_manager_interface, 3);
+      NSDebugLog(@"wayland: found wl_data_device_manager interface");
+    }
 }
 
 static void handle_global_remove(void *data, struct wl_registry *registry,
@@ -251,6 +257,10 @@ NSToWayland(struct window *window, int ns_y)
 
   inputServer = [[WaylandInputServer allocWithZone: [self zone]]
 		   initWithDelegate: nil name: @"WaylandInput"];
+
+  /* Set up wl_data_device now that both seat and data_device_manager
+   * are guaranteed to be available after the registry roundtrip.      */
+  [self _setupDataDevice];
 
   return self;
 }

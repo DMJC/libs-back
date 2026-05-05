@@ -96,6 +96,21 @@ typedef struct _WaylandConfig
   struct zxdg_decoration_manager_v1   *decoration_manager;
   int seat_version;
 
+  /* Data-device manager (wl_data_device_manager) and per-seat data device.
+   * Used for both clipboard selection and drag-and-drop.                  */
+  struct wl_data_device_manager *data_device_manager;
+  struct wl_data_device         *data_device;
+
+  /* Receive-side DnD state — valid while a drag is over one of our surfaces */
+  struct {
+    struct wl_data_offer *offer;         /* current incoming offer, or NULL  */
+    uint32_t              enter_serial;
+    struct wl_surface    *surface;       /* wl_surface the drag is over      */
+    float                 x, y;          /* compositor coords (surface-rel.) */
+    void                 *mime_types;    /* NSMutableArray *, retained by us */
+    BOOL                  active;        /* YES between enter and leave/drop */
+  } dnd_recv;
+
   struct wl_list output_list;
   int		 output_count;
   struct wl_list window_list;
@@ -204,6 +219,8 @@ struct window *get_window_with_id(WaylandConfig *wlconfig, int winid);
 - (id <NSDraggingInfo>) dragInfo;
 - (BOOL) addDragTypes: (NSArray *)types toWindow: (NSWindow *)win;
 - (BOOL) removeDragTypes: (NSArray *)types fromWindow: (NSWindow *)win;
+/** Called after both data_device_manager and seat are available. */
+- (void) _setupDataDevice;
 @end
 
 @interface WaylandServer (InputMethod)
