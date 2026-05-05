@@ -29,6 +29,7 @@
 #include <AppKit/NSEvent.h>
 #include <AppKit/NSApplication.h>
 #include <AppKit/NSGraphics.h>
+#include <Foundation/NSDebug.h>
 
 static void
 xdg_surface_on_configure(void *data, struct xdg_surface *xdg_surface,
@@ -121,9 +122,39 @@ static void
 xdg_popup_done(void *data, struct xdg_popup *xdg_popup)
 {
   struct window *window = data;
-  window->terminated = YES;
+
+  /* Notify AppKit that the popup was dismissed by the compositor so menus
+     and other popup clients can close cleanly through the normal path. */
+  NSWindow *nswindow = GSWindowWithNumber(window->window_id);
+  if (nswindow)
+    {
+      NSEvent *ev = [NSEvent otherEventWithType:NSAppKitDefined
+                                       location:NSZeroPoint
+                                  modifierFlags:0
+                                      timestamp:0
+                                   windowNumber:window->window_id
+                                        context:GSCurrentContext()
+                                        subtype:GSAppKitWindowClose
+                                          data1:0
+                                          data2:0];
+      [nswindow sendEvent:ev];
+    }
+
+  /* Clean up the Wayland protocol objects.  Null all pointers so that the
+     subsequent termwindow:/destroySurfaceRole: path is a safe no-op.       */
   xdg_popup_destroy(xdg_popup);
-  wl_surface_destroy(window->surface);
+  window->popup = NULL;
+  if (window->xdg_surface)
+    {
+      xdg_surface_destroy(window->xdg_surface);
+      window->xdg_surface = NULL;
+    }
+  if (window->surface)
+    {
+      wl_surface_destroy(window->surface);
+      window->surface = NULL;
+    }
+  window->terminated = YES;
 }
 
 static void
@@ -150,4 +181,19 @@ const struct xdg_popup_listener xdg_popup_listener = {
 const struct xdg_toplevel_listener xdg_toplevel_listener = {
   .configure = xdg_toplevel_configure,
   .close = xdg_toplevel_close_handler,
+};
+
+static void
+toplevel_decoration_on_configure(void *data,
+                                  struct zxdg_toplevel_decoration_v1 *decoration,
+                                  uint32_t mode)
+{
+  struct window *window = data;
+  NSDebugLog(@"[%d] decoration configure: %s", window->window_id,
+             mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+               ? "server-side" : "client-side");
+}
+
+const struct zxdg_toplevel_decoration_v1_listener toplevel_decoration_listener = {
+  .configure = toplevel_decoration_on_configure,
 };

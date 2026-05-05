@@ -69,6 +69,10 @@ extern const struct zwlr_layer_surface_v1_listener layer_surface_listener;
 
 extern const struct xdg_popup_listener xdg_popup_listener;
 
+extern const struct zxdg_toplevel_decoration_v1_listener toplevel_decoration_listener;
+
+static BOOL handlesWindowDecorations = NO;
+
 static void
 handle_global(void *data, struct wl_registry *registry, uint32_t name,
 	      const char *interface, uint32_t version)
@@ -135,6 +139,12 @@ handle_global(void *data, struct wl_registry *registry, uint32_t name,
       wlconfig->subcompositor
 	= wl_registry_bind(registry, name, &wl_subcompositor_interface, 1);
       NSDebugLog(@"wayland: found subcompositor interface");
+    }
+  else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
+    {
+      wlconfig->decoration_manager
+	= wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
+      NSDebugLog(@"wayland: found xdg-decoration-manager interface");
     }
 }
 
@@ -223,6 +233,22 @@ NSToWayland(struct window *window, int ns_y)
 	       @"compositor must support the stable XDG Shell protocol"];
     }
 
+  /* Determine decoration mode. Default: use SSD if the compositor supports it.
+     The user can override with GSBackHandlesWindowDecorations in defaults.   */
+  NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+  if ([defs objectForKey: @"GSBackHandlesWindowDecorations"])
+    {
+      handlesWindowDecorations
+        = [defs boolForKey: @"GSBackHandlesWindowDecorations"];
+    }
+  else
+    {
+      handlesWindowDecorations = (wlconfig->decoration_manager != NULL);
+    }
+  NSDebugLog(@"wayland: handlesWindowDecorations=%s (decoration_manager=%s)",
+             handlesWindowDecorations ? "YES" : "NO",
+             wlconfig->decoration_manager ? "available" : "not available");
+
   inputServer = [[WaylandInputServer allocWithZone: [self zone]]
 		   initWithDelegate: nil name: @"WaylandInput"];
 
@@ -273,13 +299,18 @@ NSToWayland(struct window *window, int ns_y)
 - (void)dealloc
 {
   NSDebugLog(@"Destroying Wayland Server");
+  if (wlconfig->decoration_manager)
+    {
+      zxdg_decoration_manager_v1_destroy(wlconfig->decoration_manager);
+      wlconfig->decoration_manager = NULL;
+    }
   DESTROY(inputServer);
   [super dealloc];
 }
 
 - (BOOL)handlesWindowDecorations
 {
-  return NO;
+  return handlesWindowDecorations;
 }
 
 - (void)restrictWindow:(int)win toImage:(NSImage *)image
@@ -633,6 +664,20 @@ WaylandServer (WindowOps)
 	{
 	  [self createSurfaceShell:window];
 	}
+      /* If the Cairo surface was destroyed (e.g. the window was previously
+         ordered out), recreate it now by directly re-initialising the window
+         device on the window's existing graphics context.  This is the same
+         work _processResizeEvent does, but without dispatching an AppKit
+         event — AppKit events at this point cause panels to close
+         immediately.  Without this, a reused panel (e.g. NSOpenPanel
+         singleton) is ordered in with no backing surface and stays blank.  */
+      if (window->wcs == NULL)
+        {
+          NSWindow *nswindow = GSWindowWithNumber(window->window_id);
+          NSGraphicsContext *ctxt = nswindow ? [nswindow graphicsContext] : nil;
+          if (ctxt)
+            [self setWindowdevice:window->window_id forContext:ctxt];
+        }
       NSRect rect = NSMakeRect(window->pos_x, window->pos_y, window->width,
 			       window->height);
       [window->instance flushwindowrect:rect:window->window_id];
@@ -770,14 +815,32 @@ WaylandServer (WindowOps)
 - (void)setParentWindow:(int)parentWin forChildWindow:(int)childWin
 {
   if (parentWin == 0)
+    return;
+
+  struct window *parent = get_window_with_id(wlconfig, parentWin);
+  struct window *child  = get_window_with_id(wlconfig, childWin);
+  NSDebugLog(@"setParentWindow: parent=%d child=%d level=%d", parentWin,
+             childWin, child->level);
+
+  /* True transient popups (menus, dropdowns) use xdg_popup so the compositor
+     can grab the pointer/keyboard and dismiss them automatically.  Everything
+     else (panels, dialogs, alerts) must remain an xdg_toplevel; we just tell
+     the compositor which window is the logical parent so it can stack and
+     position the dialog correctly.  Creating dialogs as xdg_popup causes the
+     compositor to dismiss them on any focus change, which is the root cause
+     of the premature-close bug.                                              */
+  if (child->level == NSPopUpMenuWindowLevel
+      || child->level == NSSubmenuWindowLevel)
     {
+      [self createPopupShell:child withParentShell:parent];
       return;
     }
-  NSDebugLog(@"setParentWindow: parent=%d child=%d", parentWin, childWin);
-  struct window *parent = get_window_with_id(wlconfig, parentWin);
-  struct window *child = get_window_with_id(wlconfig, childWin);
 
-  [self createPopupShell:child withParentShell:parent];
+  /* Record the parent for use in createTopLevel: when the surface is created,
+     and apply it immediately if the child already has a toplevel.            */
+  child->parent_id = parentWin;
+  if (child->toplevel && parent->toplevel)
+    xdg_toplevel_set_parent(child->toplevel, parent->toplevel);
 }
 
 - (void)setwindowlevel:(int)level:(int)win
@@ -829,6 +892,15 @@ WaylandServer (WindowOps)
   if (window->usesOpenGL)
     {
       NSDebugLog(@"[%d] skipping cairo flush for OpenGL-backed window", win);
+      return;
+    }
+
+  if (window->wcs == NULL)
+    {
+      /* Surface not yet created or was destroyed — record that a buffer
+         attach is pending so xdg_surface_on_configure can flush once the
+         surface is ready.                                                */
+      window->buffer_needs_attach = YES;
       return;
     }
 
@@ -967,11 +1039,64 @@ WaylandServer (SurfaceRoles)
 
       xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, window->width,
 				      window->height);
+
+      /* Request server-side decorations if supported and desired. */
+      if (wlconfig->decoration_manager && handlesWindowDecorations)
+        {
+          window->decoration
+            = zxdg_decoration_manager_v1_get_toplevel_decoration(
+                wlconfig->decoration_manager, window->toplevel);
+          zxdg_toplevel_decoration_v1_add_listener(
+            window->decoration, &toplevel_decoration_listener, window);
+          zxdg_toplevel_decoration_v1_set_mode(
+            window->decoration,
+            ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+          NSDebugLog(@"[%d] requested server-side decorations", win);
+        }
+
+      /* Apply deferred parent set from setParentWindow:forChildWindow:.
+         Dialogs store their parent_id there before the surface is created. */
+      if (window->parent_id != 0)
+        {
+          struct window *parent
+            = get_window_with_id(wlconfig, window->parent_id);
+          if (parent && parent->toplevel)
+            xdg_toplevel_set_parent(window->toplevel, parent->toplevel);
+        }
+      else
+        {
+          /* For modal dialogs opened without an explicit parent (e.g.
+             NSOpenPanel.runModal, NSAlert.runModal), automatically set the
+             application's main window as the xdg_toplevel parent.  Without
+             this the compositor has no way to know the dialog belongs to the
+             app, so it may raise another window above the dialog when focus
+             moves — making the dialog appear to disappear.  Ambrosia's
+             modal-redirect logic (focusView:) also requires tp->parent to
+             detect and protect modal dialogs.                              */
+          NSWindow *nswin = GSWindowWithNumber(window->window_id);
+          NSWindow *modal = [NSApp modalWindow];
+          if (nswin != nil && nswin == modal)
+            {
+              NSWindow *main = [NSApp mainWindow];
+              if (main != nil && main != nswin)
+                {
+                  struct window *parent
+                    = get_window_with_id(wlconfig, (int)[main windowNumber]);
+                  if (parent && parent->toplevel)
+                    xdg_toplevel_set_parent(window->toplevel, parent->toplevel);
+                }
+            }
+        }
     }
 
   wl_surface_commit(window->surface);
-  wl_display_dispatch_pending(window->wlconfig->display);
-  wl_display_flush(window->wlconfig->display);
+  /* Use roundtrip (not just dispatch_pending+flush) so the compositor sends
+     xdg_surface_configure before we return.  Without this, modal dialogs
+     entered via [NSApp runModalForWindow:] never appear: the configure event
+     arrives after the modal run loop is already spinning, and that loop may
+     not process Wayland events.  createPopupShell: already did a roundtrip
+     for the same reason; xdg_toplevel surfaces need it too.              */
+  wl_display_roundtrip(window->wlconfig->display);
 }
 
 - (void)createLayerShell:(struct window *)window
@@ -1188,6 +1313,11 @@ WaylandServer (SurfaceRoles)
     {
       if (window->toplevel)
 	{
+	  if (window->decoration)
+	    {
+	      zxdg_toplevel_decoration_v1_destroy(window->decoration);
+	      window->decoration = NULL;
+	    }
 	  xdg_toplevel_destroy(window->toplevel);
 	  window->toplevel = NULL;
 	}
@@ -1202,6 +1332,7 @@ WaylandServer (SurfaceRoles)
   if (window->wcs)
     {
       [window->wcs destroySurface];
+      window->wcs = NULL;
     }
   window->configured = NO;
 }

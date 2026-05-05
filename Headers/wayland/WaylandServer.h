@@ -42,6 +42,7 @@
 
 #include "wayland/xdg-shell-client-protocol.h"
 #include "wayland/wlr-layer-shell-client-protocol.h"
+#include "wayland/xdg-decoration-unstable-v1-client-protocol.h"
 
 struct pointer
 {
@@ -65,12 +66,19 @@ struct pointer
 
 };
 
+/* Forward declaration so struct cursor can reference it. */
+struct pool_buffer;
+
 struct cursor
 {
   struct wl_cursor *cursor;
   struct wl_surface *surface;
   struct wl_cursor_image *image;
   struct wl_buffer *buffer;
+  /* Non-NULL for image cursors created by -imagecursor::: (from imagecursor:).
+     Points to the pool_buffer that backs the cursor surface pixel data.
+     NULL for theme cursors obtained via -standardcursor::. */
+  struct pool_buffer *pool_buffer;
 };
 
 typedef struct _WaylandConfig
@@ -84,7 +92,8 @@ typedef struct _WaylandConfig
   struct wl_keyboard	     *keyboard;
   struct xdg_wm_base	     *wm_base;
   struct zwlr_layer_shell_v1 *layer_shell;
-  struct wl_subcompositor    *subcompositor;
+  struct wl_subcompositor              *subcompositor;
+  struct zxdg_decoration_manager_v1   *decoration_manager;
   int seat_version;
 
   struct wl_list output_list;
@@ -163,15 +172,17 @@ struct window
   float saved_pos_y;
   int	is_out;
   int	level;
+  int   parent_id;
 
-  struct wl_surface	    *surface;
-  struct xdg_surface	     *xdg_surface;
-  struct xdg_toplevel	      *toplevel;
-  struct xdg_popup		   *popup;
-  struct xdg_positioner	*positioner;
-  struct zwlr_layer_surface_v1 *layer_surface;
-  struct output		*output;
-  CairoSurface		       *wcs;
+  struct wl_surface	                *surface;
+  struct xdg_surface	                *xdg_surface;
+  struct xdg_toplevel	                *toplevel;
+  struct xdg_popup	                *popup;
+  struct xdg_positioner                 *positioner;
+  struct zwlr_layer_surface_v1          *layer_surface;
+  struct zxdg_toplevel_decoration_v1    *decoration;
+  struct output		                *output;
+  CairoSurface		                *wcs;
 };
 
 struct window *get_window_with_id(WaylandConfig *wlconfig, int winid);
