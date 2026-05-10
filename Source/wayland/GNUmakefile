@@ -51,6 +51,10 @@ WaylandServer+Keyboard.m  \
 WaylandServer+Seat.m  \
 WaylandServer+Xdgshell.m  \
 WaylandServer+Layershell.m  \
+WaylandGLContext.m  \
+WaylandGLPixelFormat.m  \
+
+wayland_LIBRARIES_DEPEND_UPON += -lEGL -lwayland-egl
 
 -include GNUmakefile.preamble
 
